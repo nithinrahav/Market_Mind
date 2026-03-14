@@ -1,0 +1,26 @@
+# Environment variables — NEVER commit real keys
+.env
+.env.local
+.env.*.local
+
+# Streamlit secrets — NEVER commit real keys
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
