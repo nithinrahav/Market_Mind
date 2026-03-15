@@ -18,6 +18,11 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import config
+from modules.analytics  import get_earnings_calendar, get_sector_heatmap, get_peer_comparison, get_insider_activity
+from modules.macro      import get_market_overview, get_relative_strength, get_yield_curve
+from modules.risk       import get_portfolio_risk_metrics, get_correlation_matrix, get_rebalancing_suggestions
+from modules.sec_filing import get_recent_filings, analyze_filing, summarize_earnings
+from modules import alerts as alert_mgr
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +113,8 @@ def _init_state():
         "agent":                 None,
         "oauth_url":             "",
         "selected_ticker":       "GOOGL",
+        "price_alerts":          [],
+        "alerts_last_checked":   "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -262,6 +269,78 @@ def _render_sidebar():
         if ticker_input:
             st.session_state["selected_ticker"] = ticker_input
 
+        # ── Price Alerts ───────────────────────────────────────────────────────
+        st.markdown("---")
+        _render_alerts_sidebar()
+
+
+def _render_alerts_sidebar():
+    """Render the price-alert section inside the sidebar."""
+    with st.expander("🔔 Price Alerts", expanded=False):
+        # Check active alerts on every render (throttled to once per run)
+        alerts = st.session_state.get("price_alerts", [])
+        if alerts:
+            # Gather current prices for all alert tickers
+            alert_tickers = list({a["symbol"] for a in alert_mgr.get_active_alerts(alerts)})
+            cur_prices: dict[str, float] = {}
+            for sym in alert_tickers:
+                try:
+                    from modules.stock_data import get_current_price
+                    cur_prices[sym] = get_current_price(sym)["price"]
+                except Exception:
+                    pass
+
+            if cur_prices:
+                updated, fired = alert_mgr.check_alerts(alerts, cur_prices)
+                st.session_state["price_alerts"] = updated
+                for a in fired:
+                    cond = "above" if a["condition"] == "above" else "below"
+                    st.success(
+                        f"🔔 **{a['symbol']}** hit ${a['triggered_price']:,.2f} "
+                        f"({cond} ${a['target']:,.2f})"
+                    )
+
+        # Add new alert form
+        st.markdown("**Add Alert**")
+        c1, c2 = st.columns(2)
+        with c1:
+            alert_sym   = st.text_input("Ticker", key="alert_sym", placeholder="AAPL").upper().strip()
+            alert_cond  = st.selectbox("Condition", ["above", "below"], key="alert_cond")
+        with c2:
+            alert_price = st.number_input("Price ($)", min_value=0.01, value=100.0, key="alert_price")
+            alert_note  = st.text_input("Note (optional)", key="alert_note")
+
+        if st.button("Add Alert", key="add_alert_btn"):
+            if alert_sym and alert_price > 0:
+                st.session_state["price_alerts"] = alert_mgr.add_alert(
+                    st.session_state["price_alerts"],
+                    alert_sym, alert_price, alert_cond, alert_note,
+                )
+                st.success(f"Alert set: {alert_sym} {alert_cond} ${alert_price:,.2f}")
+                st.rerun()
+
+        # Active alerts list
+        active = alert_mgr.get_active_alerts(st.session_state.get("price_alerts", []))
+        if active:
+            st.markdown("**Active Alerts**")
+            for a in active:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.caption(f"{a['symbol']} {a['condition']} ${a['target']:,.2f}" + (f" — {a['note']}" if a['note'] else ""))
+                with col2:
+                    if st.button("✕", key=f"rm_alert_{a['id']}"):
+                        st.session_state["price_alerts"] = alert_mgr.remove_alert(
+                            st.session_state["price_alerts"], a["id"]
+                        )
+                        st.rerun()
+
+        # Triggered alerts
+        triggered = alert_mgr.get_triggered_alerts(st.session_state.get("price_alerts", []))
+        if triggered:
+            st.markdown("**Triggered**")
+            for a in triggered[:5]:
+                st.caption(f"✅ {a['symbol']} hit ${a['triggered_price']:,.2f} at {a['triggered_at']}")
+
 
 def _load_portfolio():
     """Fetch portfolio from E*Trade and store in session state."""
@@ -393,6 +472,9 @@ def _render_portfolio_tab():
                 height=350,
             )
             st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Portfolio Risk Metrics ──────────────────────────────────────────────────
+    _render_portfolio_risk_section(portfolio)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,6 +747,47 @@ def _render_stock_dashboard_tab():
                 url    = art.get("url", "#")
                 st.markdown(f"- **[{title}]({url})** — *{source}, {date}*")
 
+    # ── Relative Strength vs S&P 500 ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"Relative Strength vs S&P 500")
+    with st.spinner("Loading relative strength data..."):
+        try:
+            rs_df = get_relative_strength(sym, period=period)
+            if not rs_df.empty and sym in rs_df.columns and "SPY" in rs_df.columns:
+                import plotly.graph_objects as _go
+                fig_rs = _go.Figure()
+                fig_rs.add_trace(_go.Scatter(
+                    x=rs_df.index, y=rs_df[sym],
+                    name=sym, line=dict(color="#60a5fa", width=2),
+                ))
+                fig_rs.add_trace(_go.Scatter(
+                    x=rs_df.index, y=rs_df["SPY"],
+                    name="S&P 500 (SPY)", line=dict(color="#9ca3af", width=1.5, dash="dash"),
+                ))
+                fig_rs.update_layout(
+                    paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
+                    font_color="white", height=300,
+                    legend=dict(font=dict(color="white")),
+                    yaxis=dict(color="white", gridcolor="#2d3748", title="Normalised (base=100)"),
+                    xaxis=dict(color="white"),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_rs, use_container_width=True)
+
+                if "Ratio" in rs_df.columns:
+                    last_ratio = float(rs_df["Ratio"].dropna().iloc[-1])
+                    direction  = "outperforming" if last_ratio > 100 else "underperforming"
+                    color      = "#4ade80" if last_ratio > 100 else "#f87171"
+                    st.markdown(
+                        f"<span style='color:{color}'>**{sym}** is currently "
+                        f"**{direction}** the S&P 500 — ratio: {last_ratio:.1f}</span>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("Relative strength data unavailable.")
+        except Exception as exc:
+            st.warning(f"Could not load relative strength: {exc}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 3 – Market Rundown
@@ -826,6 +949,359 @@ def _render_chat_tab():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Portfolio Risk section (embedded in Portfolio tab)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_portfolio_risk_section(portfolio: list):
+    """Risk metrics + rebalancing — shown at the bottom of the Portfolio tab."""
+    if not portfolio or not any(float(p.get("market_value", 0) or 0) > 0 for p in portfolio):
+        return
+
+    st.markdown("---")
+    st.subheader("Portfolio Risk Analytics")
+
+    period = st.selectbox("Analysis period", ["6mo", "1y", "2y"], index=1, key="risk_period")
+
+    if st.button("Compute Risk Metrics", key="compute_risk"):
+        with st.spinner("Calculating risk metrics..."):
+            metrics = get_portfolio_risk_metrics(portfolio, period=period)
+
+        if "error" in metrics:
+            st.warning(metrics["error"])
+        else:
+            # ── Portfolio-level KPIs ────────────────────────────────────────
+            r1, r2, r3, r4, r5 = st.columns(5)
+            r1.metric("Ann. Return",    f"{metrics['ann_return_pct']:+.1f}%")
+            r2.metric("Ann. Volatility", f"{metrics['ann_vol_pct']:.1f}%")
+            r3.metric("Sharpe Ratio",   f"{metrics['sharpe_ratio']:.2f}",
+                      help="Risk-adjusted return vs 5% risk-free rate")
+            r4.metric("Max Drawdown",   f"{metrics['max_drawdown_pct']:.1f}%",
+                      delta_color="inverse")
+            r5.metric("Portfolio Beta", f"{metrics['beta']:.2f}" if metrics.get("beta") else "N/A",
+                      help="Sensitivity to S&P 500 moves")
+
+            st.caption(f"1-day 95% Value at Risk (parametric): **{metrics['var_95_pct']:.2f}%** of portfolio value")
+
+            # ── Per-stock breakdown ─────────────────────────────────────────
+            st.markdown("**Per-Stock Risk Breakdown**")
+            sm_df = pd.DataFrame(metrics["stock_metrics"])
+            sm_df.columns = [c.replace("_", " ").title() for c in sm_df.columns]
+            st.dataframe(sm_df, use_container_width=True, hide_index=True)
+
+            # ── Correlation matrix ──────────────────────────────────────────
+            symbols = [p["symbol"] for p in portfolio if float(p.get("market_value", 0) or 0) > 0]
+            if len(symbols) >= 2:
+                st.markdown("**Return Correlation Matrix**")
+                with st.spinner("Loading correlation data..."):
+                    corr = get_correlation_matrix(symbols, period=period)
+                if not corr.empty:
+                    import plotly.express as _px
+                    fig_corr = _px.imshow(
+                        corr,
+                        color_continuous_scale="RdBu_r",
+                        zmin=-1, zmax=1,
+                        text_auto=True,
+                    )
+                    fig_corr.update_layout(
+                        paper_bgcolor="#0e1117",
+                        plot_bgcolor="#1a1f2e",
+                        font_color="white",
+                        height=400,
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+
+    # ── Rebalancing ─────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Rebalancing Suggestions")
+    st.caption("Enter target allocations (%) for each position. Totals should sum to 100.")
+
+    symbols  = [p["symbol"] for p in portfolio]
+    targets: dict[str, float] = {}
+    n_cols   = min(4, len(symbols))
+    cols     = st.columns(n_cols)
+    eq_weight = round(100 / len(symbols), 1) if symbols else 0
+
+    for i, sym in enumerate(symbols):
+        with cols[i % n_cols]:
+            targets[sym] = st.number_input(
+                sym, min_value=0.0, max_value=100.0,
+                value=eq_weight, step=1.0,
+                key=f"tgt_{sym}",
+            )
+
+    total_target = sum(targets.values())
+    st.caption(f"Total target allocation: **{total_target:.1f}%** (should be 100%)")
+
+    if st.button("Generate Rebalancing Plan", key="rebal_btn"):
+        plan = get_rebalancing_suggestions(portfolio, targets)
+        if plan.empty:
+            st.info("No rebalancing needed or no portfolio data.")
+        else:
+            def _color_drift(val):
+                try:
+                    v = float(val)
+                    if abs(v) < 1:    return "color: #9ca3af"
+                    return "color: #f87171" if v > 0 else "color: #4ade80"
+                except Exception:
+                    return ""
+            styled = plan.style.applymap(_color_drift, subset=["Drift"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 5 – Analytics (Earnings Calendar, Sector Heatmap, Peers, Insider)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_analytics_tab():
+    st.header("Market Analytics")
+
+    # ── Economic Indicators ────────────────────────────────────────────────────
+    st.subheader("Economic Indicators")
+    with st.spinner("Loading macro data..."):
+        macro = get_market_overview()
+
+    if macro:
+        cols = st.columns(min(5, len(macro)))
+        for i, item in enumerate(macro[:10]):
+            with cols[i % 5]:
+                delta_color = "normal" if item["change_pct"] >= 0 else "inverse"
+                st.metric(
+                    item["label"],
+                    item["fmt_value"],
+                    f"{item['change_pct']:+.2f}%",
+                    delta_color=delta_color,
+                )
+
+    # ── Yield Curve ─────────────────────────────────────────────────────────────
+    with st.expander("US Treasury Yield Curve", expanded=False):
+        with st.spinner("Loading yield curve..."):
+            yc = get_yield_curve()
+        if not yc.empty:
+            import plotly.express as _px
+            fig_yc = _px.line(yc, x="Maturity", y="Yield (%)", markers=True)
+            fig_yc.update_traces(line_color="#60a5fa", marker_color="#60a5fa")
+            fig_yc.update_layout(
+                paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
+                font_color="white", height=250,
+                xaxis=dict(color="white"), yaxis=dict(color="white", gridcolor="#2d3748"),
+            )
+            st.plotly_chart(fig_yc, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Sector Heatmap ──────────────────────────────────────────────────────────
+    st.subheader("Sector Performance Heatmap")
+    heat_period = st.radio(
+        "Period", ["1d", "1w", "1mo", "ytd"],
+        horizontal=True, index=2, key="heat_period",
+    )
+
+    with st.spinner("Loading sector data..."):
+        sector_df = get_sector_heatmap(heat_period)
+
+    if not sector_df.empty:
+        import plotly.express as _px
+        # Bar chart
+        sector_df_sorted = sector_df.sort_values("change_pct", ascending=True)
+        colors = ["#4ade80" if v >= 0 else "#f87171" for v in sector_df_sorted["change_pct"]]
+        fig_sec = go.Figure(go.Bar(
+            x=sector_df_sorted["change_pct"],
+            y=sector_df_sorted["sector"],
+            orientation="h",
+            marker_color=colors,
+            text=sector_df_sorted["change_pct"].apply(lambda x: f"{x:+.2f}%"),
+            textposition="outside",
+        ))
+        fig_sec.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#1a1f2e",
+            font_color="white", height=380,
+            xaxis=dict(color="white", gridcolor="#2d3748", title="Change (%)"),
+            yaxis=dict(color="white"),
+        )
+        st.plotly_chart(fig_sec, use_container_width=True)
+
+        # Table with YTD
+        disp = sector_df[["sector", "etf", "price", "change_pct", "ytd_pct"]].copy()
+        disp.columns = ["Sector", "ETF", "Price", f"Change % ({heat_period})", "YTD %"]
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Earnings Calendar ───────────────────────────────────────────────────────
+    st.subheader("Earnings Calendar")
+
+    portfolio   = st.session_state.get("portfolio", [])
+    port_syms   = [p["symbol"] for p in portfolio if p.get("symbol")]
+    default_sym = ", ".join(port_syms) if port_syms else "AAPL, MSFT, GOOGL, NVDA, META"
+    earn_input  = st.text_input(
+        "Tickers (comma-separated)", value=default_sym, key="earn_tickers",
+    )
+    earn_syms   = [s.strip().upper() for s in earn_input.split(",") if s.strip()]
+
+    if earn_syms and st.button("Load Earnings Calendar", key="load_earnings"):
+        with st.spinner("Fetching earnings dates..."):
+            cal = get_earnings_calendar(earn_syms)
+
+        if cal:
+            cal_rows = []
+            for c in cal:
+                eps_est = f"${c['eps_estimate']:.2f}" if c.get("eps_estimate") is not None else "N/A"
+                rev_est = f"${c['revenue_estimate']/1e9:.2f}B" if c.get("revenue_estimate") else "N/A"
+                surp    = f"{c['last_surprise_pct']:+.1f}%" if c.get("last_surprise_pct") is not None else "N/A"
+                cal_rows.append({
+                    "Symbol":          c["symbol"],
+                    "Name":            c.get("name", c["symbol"]),
+                    "Earnings Date":   c.get("earnings_date", "N/A"),
+                    "EPS Estimate":    eps_est,
+                    "Rev Estimate":    rev_est,
+                    "Last Surprise":   surp,
+                    "Trailing EPS":    f"${c['trailing_eps']:.2f}" if c.get("trailing_eps") else "N/A",
+                    "Sector":          c.get("sector", "N/A"),
+                })
+            st.dataframe(pd.DataFrame(cal_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Peer Comparison ─────────────────────────────────────────────────────────
+    st.subheader("Peer Comparison")
+    peer_sym = st.text_input(
+        "Stock to compare", value=st.session_state["selected_ticker"],
+        key="peer_ticker",
+    ).upper().strip()
+
+    if peer_sym and st.button("Compare with Peers", key="peer_btn"):
+        with st.spinner(f"Fetching peer data for {peer_sym}..."):
+            peer_df = get_peer_comparison(peer_sym)
+
+        if not peer_df.empty:
+            # Highlight the target ticker row
+            def _highlight_target(row):
+                if row["Ticker"] == peer_sym:
+                    return ["background-color: #1e3a5f"] * len(row)
+                return [""] * len(row)
+            styled_peers = peer_df.style.apply(_highlight_target, axis=1)
+            st.dataframe(styled_peers, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No peer data found for {peer_sym}.")
+
+    st.markdown("---")
+
+    # ── Insider & Institutional Activity ────────────────────────────────────────
+    st.subheader("Insider & Institutional Activity")
+    insider_sym = st.text_input(
+        "Ticker", value=st.session_state["selected_ticker"], key="insider_ticker",
+    ).upper().strip()
+
+    if insider_sym and st.button("Load Insider Data", key="insider_btn"):
+        with st.spinner(f"Loading insider data for {insider_sym}..."):
+            activity = get_insider_activity(insider_sym)
+
+        # Major holders summary
+        mh = activity.get("major_holders", {})
+        if mh:
+            st.markdown("**Ownership Breakdown**")
+            mh_cols = st.columns(min(4, len(mh)))
+            for i, (label, val) in enumerate(list(mh.items())[:4]):
+                mh_cols[i].metric(label, str(val))
+
+        # Insider transactions
+        ins_df = activity.get("insider_transactions", pd.DataFrame())
+        if not ins_df.empty:
+            st.markdown("**Recent Insider Transactions**")
+            st.dataframe(ins_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No insider transaction data available.")
+
+        # Institutional holders
+        inst_df = activity.get("institutional_holders", pd.DataFrame())
+        if not inst_df.empty:
+            st.markdown("**Top Institutional Holders**")
+            st.dataframe(inst_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No institutional holder data available.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab 6 – AI Research (SEC Filing Analyzer + Earnings Summarizer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_research_tab():
+    st.header("AI Research")
+    st.caption("Powered by SEC EDGAR (free, no API key) + Claude AI analysis.")
+
+    if not config.ANTHROPIC_API_KEY:
+        st.error("**ANTHROPIC_API_KEY** is not set. Add it to your secrets to use AI Research.")
+        return
+
+    research_sym = st.text_input(
+        "Ticker Symbol",
+        value=st.session_state["selected_ticker"],
+        key="research_ticker",
+    ).upper().strip()
+
+    if not research_sym:
+        return
+
+    tab_earn, tab_annual, tab_quarterly = st.tabs([
+        "📋 Earnings Release (8-K)",
+        "📄 Annual Report (10-K)",
+        "📊 Quarterly Report (10-Q)",
+    ])
+
+    with tab_earn:
+        st.markdown(f"Summarise the most recent **earnings release (8-K)** for **{research_sym}**.")
+
+        # Show filing list
+        with st.expander("Available 8-K Filings", expanded=False):
+            with st.spinner("Fetching SEC filing list..."):
+                filings_8k = get_recent_filings(research_sym, form_types=["8-K"], max_count=5)
+            if filings_8k:
+                for f in filings_8k:
+                    st.markdown(f"- **{f['form']}** filed {f['date']} — {f['desc']}")
+            else:
+                st.info("No 8-K filings found. Check the ticker symbol.")
+
+        if st.button("Summarise Earnings Release", key="earn_sum_btn", type="primary"):
+            with st.spinner("Fetching filing from SEC EDGAR and analysing with Claude..."):
+                result = summarize_earnings(research_sym)
+            st.markdown(result)
+
+    with tab_annual:
+        st.markdown(f"Analyse the most recent **annual report (10-K)** for **{research_sym}**.")
+
+        with st.expander("Available 10-K Filings", expanded=False):
+            with st.spinner("Fetching SEC filing list..."):
+                filings_10k = get_recent_filings(research_sym, form_types=["10-K"], max_count=3)
+            if filings_10k:
+                for f in filings_10k:
+                    st.markdown(f"- **{f['form']}** filed {f['date']} — {f['desc']}")
+            else:
+                st.info("No 10-K filings found.")
+
+        if st.button("Analyse Annual Report", key="ann_btn", type="primary"):
+            with st.spinner("Fetching 10-K from SEC EDGAR and analysing with Claude..."):
+                result = analyze_filing(research_sym, "10-K")
+            st.markdown(result)
+
+    with tab_quarterly:
+        st.markdown(f"Analyse the most recent **quarterly report (10-Q)** for **{research_sym}**.")
+
+        with st.expander("Available 10-Q Filings", expanded=False):
+            with st.spinner("Fetching SEC filing list..."):
+                filings_10q = get_recent_filings(research_sym, form_types=["10-Q"], max_count=4)
+            if filings_10q:
+                for f in filings_10q:
+                    st.markdown(f"- **{f['form']}** filed {f['date']} — {f['desc']}")
+            else:
+                st.info("No 10-Q filings found.")
+
+        if st.button("Analyse Quarterly Report", key="qtr_btn", type="primary"):
+            with st.spinner("Fetching 10-Q from SEC EDGAR and analysing with Claude..."):
+                result = analyze_filing(research_sym, "10-Q")
+            st.markdown(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -839,10 +1315,12 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "💼 Portfolio",
         "📊 Stock Dashboard",
         "📰 Market Rundown",
+        "🌐 Analytics",
+        "🔬 AI Research",
         "🤖 AI Analyst Chat",
     ])
 
@@ -856,6 +1334,12 @@ def main():
         _render_market_rundown_tab()
 
     with tab4:
+        _render_analytics_tab()
+
+    with tab5:
+        _render_research_tab()
+
+    with tab6:
         _render_chat_tab()
 
 
